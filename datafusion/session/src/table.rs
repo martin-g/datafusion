@@ -423,14 +423,19 @@ pub trait TableProvider: Any + Debug + Sync + Send {
     /// Perform mutations when the returned plan executes, rather than while
     /// constructing it, so planning does not change the table.
     ///
+    /// # Row limit
+    ///
+    /// This method receives no row limit. DataFusion calls
+    /// [`Self::delete_from_args`], whose default implementation forwards to
+    /// this method when the statement has no `LIMIT`. Override
+    /// [`Self::delete_from_args`] to support `DELETE ... LIMIT n`.
+    ///
     /// # Limitations
     ///
-    /// The method receives no row limit ([#24998]). Subqueries in DML
-    /// expressions are not fully supported ([#24654]); in particular, a
-    /// subquery rewritten into a join can cause predicates to be lost before
-    /// this method is called.
+    /// Subqueries in DML expressions are not fully supported ([#24654]); in
+    /// particular, a subquery rewritten into a join can cause predicates to be
+    /// lost before this method is called.
     ///
-    /// [#24998]: https://github.com/apache/datafusion/issues/24998
     /// [#24654]: https://github.com/apache/datafusion/issues/24654
     // Hand-written `#[async_trait]` expansion to reduce compile time. See
     // <https://github.com/apache/datafusion/issues/13814#issuecomment-5292709677>
@@ -448,6 +453,64 @@ pub trait TableProvider: Any + Debug + Sync + Send {
             "DELETE not supported for {} table",
             self.table_type()
         )))
+    }
+
+    /// Delete rows matching the filter predicates, using structured arguments.
+    ///
+    /// This is the method DataFusion calls to plan a `DELETE`. [`DeleteArgs`]
+    /// carries the filters described in [`Self::delete_from`], an optional
+    /// row limit from `DELETE ... LIMIT n`, and an optional offset.
+    ///
+    /// # Evaluation Order
+    ///
+    /// As for [`Self::scan_with_args`], [`DeleteArgs::filters`] apply first,
+    /// then [`DeleteArgs::skip`] and [`DeleteArgs::limit`]: of the rows that
+    /// match every filter, leave the first `skip` and delete at most `limit`
+    /// of the rest. For example, `filters = [b > 5]`, `skip = Some(2)` and
+    /// `limit = Some(3)` delete the rows of
+    ///
+    /// ```text
+    /// OFFSET 2 LIMIT 3 (SCAN WHERE b > 5)
+    /// ```
+    ///
+    /// SQL defines no row order for a `DELETE` without `ORDER BY`, so which
+    /// matching rows are skipped and deleted is up to the provider.
+    ///
+    /// SQL `DELETE` has no `OFFSET` clause, so `skip` is set only for plans
+    /// built through the API, or when the optimizer pushes a `Limit` with an
+    /// offset into the scan of a provider that supports skip pushdown.
+    ///
+    /// # Default implementation
+    ///
+    /// Without a limit or an offset, the default implementation forwards the
+    /// filters to [`Self::delete_from`]. Otherwise it returns a "not
+    /// implemented" error, because [`Self::delete_from`] would delete every
+    /// matching row.
+    // Hand-written `#[async_trait]` expansion to reduce compile time. See
+    // <https://github.com/apache/datafusion/issues/13814#issuecomment-5292709677>
+    fn delete_from_args<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+        args: DeleteArgs,
+    ) -> BoxFuture<'async_trait, Result<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        if args.limit().is_some() {
+            return Box::pin(ready(not_impl_err!(
+                "DELETE with LIMIT not supported for {} table",
+                self.table_type()
+            )));
+        }
+        if args.skip().is_some() {
+            return Box::pin(ready(not_impl_err!(
+                "DELETE with OFFSET not supported for {} table",
+                self.table_type()
+            )));
+        }
+        self.delete_from(state, args.into_filters())
     }
 
     /// Update rows matching the filter predicates.
@@ -686,6 +749,61 @@ impl<'a> ScanArgs<'a> {
     /// See [`Self::with_statistics_requests`] for more details
     pub fn statistics_requests(&self) -> &'a [StatisticsRequest] {
         self.statistics_requests
+    }
+}
+
+/// Arguments for deleting rows with [`TableProvider::delete_from_args`].
+#[derive(Debug, Clone, Default)]
+pub struct DeleteArgs {
+    filters: Vec<Expr>,
+    limit: Option<usize>,
+    skip: Option<usize>,
+}
+
+impl DeleteArgs {
+    /// Set the filter predicates of the delete.
+    ///
+    /// See [`TableProvider::delete_from`] for how the predicates are built
+    /// and combined. Empty `filters` matches every row.
+    pub fn with_filters(mut self, filters: Vec<Expr>) -> Self {
+        self.filters = filters;
+        self
+    }
+
+    /// Get the filter predicates of the delete.
+    pub fn filters(&self) -> &[Expr] {
+        &self.filters
+    }
+
+    /// Consume the arguments and return the filter predicates.
+    pub fn into_filters(self) -> Vec<Expr> {
+        self.filters
+    }
+
+    /// Set the maximum number of rows to delete, from `DELETE ... LIMIT n`.
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Get the maximum number of rows to delete, or `None` if there is no limit.
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Set the number of matching rows to leave before deleting.
+    ///
+    /// The skipped rows are not deleted and do not count toward
+    /// [`Self::limit`].
+    pub fn with_skip(mut self, skip: Option<usize>) -> Self {
+        self.skip = skip;
+        self
+    }
+
+    /// Get the number of matching rows to leave before deleting, or `None` if
+    /// no such was specified.
+    pub fn skip(&self) -> Option<usize> {
+        self.skip
     }
 }
 

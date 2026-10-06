@@ -31,7 +31,7 @@ use datafusion::logical_expr::{
     lit,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
-use datafusion_catalog::Session;
+use datafusion_catalog::{DeleteArgs, Session};
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_physical_plan::ExecutionPlan;
@@ -1098,5 +1098,357 @@ async fn test_delete_aggregate_input_is_rejected() -> Result<()> {
     let err = result.expect_err("aggregation cannot be represented by provider filters");
     assert!(matches!(err, DataFusionError::NotImplemented(_)), "{err}");
     assert!(err.to_string().contains("Aggregate"), "{err}");
+    Ok(())
+}
+
+/// A TableProvider that captures the [`DeleteArgs`] passed to
+/// `delete_from_args()`, so it supports `DELETE ... LIMIT`.
+#[derive(Debug)]
+struct CaptureDeleteArgsProvider {
+    schema: SchemaRef,
+    filter_pushdown: TableProviderFilterPushDown,
+    skip_pushdown: bool,
+    received_args: Arc<Mutex<Option<DeleteArgs>>>,
+}
+
+impl CaptureDeleteArgsProvider {
+    fn new(schema: SchemaRef, filter_pushdown: TableProviderFilterPushDown) -> Self {
+        Self {
+            schema,
+            filter_pushdown,
+            skip_pushdown: false,
+            received_args: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn with_skip_pushdown(mut self, skip_pushdown: bool) -> Self {
+        self.skip_pushdown = skip_pushdown;
+        self
+    }
+
+    fn captured_args(&self) -> Option<DeleteArgs> {
+        self.received_args.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl TableProvider for CaptureDeleteArgsProvider {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&[usize]>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+    }
+
+    fn delete_from_args<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _state: &'life1 dyn Session,
+        args: DeleteArgs,
+    ) -> futures::future::BoxFuture<'async_trait, Result<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        *self.received_args.lock().unwrap() = Some(args);
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(
+            Schema::new(vec![Field::new("count", DataType::UInt64, false)]),
+        )));
+        Box::pin(std::future::ready(Ok(plan)))
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![self.filter_pushdown.clone(); filters.len()])
+    }
+
+    fn supports_skip_pushdown(&self) -> bool {
+        self.skip_pushdown
+    }
+}
+
+#[tokio::test]
+async fn test_delete_limit_passed_to_provider() -> Result<()> {
+    for pushdown in [
+        TableProviderFilterPushDown::Unsupported,
+        TableProviderFilterPushDown::Inexact,
+        TableProviderFilterPushDown::Exact,
+    ] {
+        let provider = Arc::new(CaptureDeleteArgsProvider::new(
+            test_schema(),
+            pushdown.clone(),
+        ));
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)?;
+
+        ctx.sql("DELETE FROM t WHERE id > 1 LIMIT 2")
+            .await?
+            .collect()
+            .await?;
+
+        let args = provider
+            .captured_args()
+            .expect("delete_from_args should be called");
+        assert_eq!(args.limit(), Some(2), "{pushdown:?}");
+        assert_eq!(args.filters().len(), 1, "{pushdown:?}");
+        assert!(args.filters()[0].to_string().contains("id"), "{pushdown:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_without_limit_passes_no_limit() -> Result<()> {
+    let provider = Arc::new(CaptureDeleteArgsProvider::new(
+        test_schema(),
+        TableProviderFilterPushDown::Unsupported,
+    ));
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)?;
+
+    ctx.sql("DELETE FROM t WHERE id > 1")
+        .await?
+        .collect()
+        .await?;
+
+    let args = provider
+        .captured_args()
+        .expect("delete_from_args should be called");
+    assert_eq!(args.limit(), None);
+    assert_eq!(args.filters().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_limit_unsupported_by_provider() -> Result<()> {
+    // `CaptureDeleteProvider` overrides only `delete_from`, which cannot
+    // honor a limit, so the default `delete_from_args` must refuse the
+    // statement rather than delete every matching row.
+    let provider = Arc::new(CaptureDeleteProvider::new(test_schema()));
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)?;
+
+    let result = ctx
+        .sql("DELETE FROM t WHERE id > 1 LIMIT 2")
+        .await?
+        .collect()
+        .await;
+
+    assert!(
+        provider.captured_filters().is_none(),
+        "DELETE ... LIMIT must not reach delete_from()"
+    );
+    let err = result.expect_err("DELETE ... LIMIT is not supported by the provider");
+    assert!(
+        err.to_string().contains("DELETE with LIMIT not supported"),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_limit_below_filter_is_rejected() -> Result<()> {
+    let provider = Arc::new(CaptureDeleteArgsProvider::new(
+        test_schema(),
+        TableProviderFilterPushDown::Unsupported,
+    ));
+    let target = provider_as_source(provider.clone());
+    let input = LogicalPlanBuilder::scan("t", Arc::clone(&target), None)?
+        .limit(0, Some(2))?
+        .filter(col("id").gt(lit(1)))?
+        .build()?;
+    let plan = LogicalPlan::Dml(DmlStatement::new(
+        "t".into(),
+        target,
+        WriteOp::Delete,
+        Arc::new(input),
+    ));
+    let result = DefaultPhysicalPlanner::default()
+        .create_physical_plan(&plan, &SessionContext::new().state())
+        .await;
+
+    assert!(provider.captured_args().is_none());
+    let err = result.expect_err("a limit below a filter cannot reach the provider");
+    assert!(matches!(err, DataFusionError::NotImplemented(_)), "{err}");
+    Ok(())
+}
+
+/// Build `DELETE FROM t WHERE id > 1` with `OFFSET skip LIMIT fetch` applied
+/// to the matching rows. SQL `DELETE` has no `OFFSET`, so the plan is built
+/// through the API.
+fn delete_with_skip_plan(
+    target: Arc<dyn TableProvider>,
+    skip: usize,
+    fetch: Option<usize>,
+) -> Result<LogicalPlan> {
+    let target = provider_as_source(target);
+    let input = LogicalPlanBuilder::scan("t", Arc::clone(&target), None)?
+        .filter(col("id").gt(lit(1)))?
+        .limit(skip, fetch)?
+        .build()?;
+    Ok(LogicalPlan::Dml(DmlStatement::new(
+        "t".into(),
+        target,
+        WriteOp::Delete,
+        Arc::new(input),
+    )))
+}
+
+#[tokio::test]
+async fn test_delete_skip_passed_to_provider() -> Result<()> {
+    for pushdown in [
+        TableProviderFilterPushDown::Unsupported,
+        TableProviderFilterPushDown::Inexact,
+        TableProviderFilterPushDown::Exact,
+    ] {
+        for skip_pushdown in [false, true] {
+            let provider = Arc::new(
+                CaptureDeleteArgsProvider::new(test_schema(), pushdown.clone())
+                    .with_skip_pushdown(skip_pushdown),
+            );
+            let plan = delete_with_skip_plan(provider.clone(), 1, Some(2))?;
+            // Run the optimizer, which may push the limit and the offset into
+            // the scan.
+            SessionContext::new()
+                .execute_logical_plan(plan)
+                .await?
+                .collect()
+                .await?;
+
+            let args = provider
+                .captured_args()
+                .expect("delete_from_args should be called");
+            let case = format!("{pushdown:?}, skip_pushdown={skip_pushdown}");
+            assert_eq!(args.skip(), Some(1), "{case}");
+            assert_eq!(args.limit(), Some(2), "{case}");
+            assert_eq!(args.filters().len(), 1, "{case}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_skip_without_limit_passed_to_provider() -> Result<()> {
+    let provider = Arc::new(CaptureDeleteArgsProvider::new(
+        test_schema(),
+        TableProviderFilterPushDown::Unsupported,
+    ));
+    let plan = delete_with_skip_plan(provider.clone(), 3, None)?;
+    SessionContext::new()
+        .execute_logical_plan(plan)
+        .await?
+        .collect()
+        .await?;
+
+    let args = provider
+        .captured_args()
+        .expect("delete_from_args should be called");
+    assert_eq!(args.skip(), Some(3));
+    assert_eq!(args.limit(), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_nested_limits_are_combined() -> Result<()> {
+    // OFFSET 1 LIMIT 2 of (OFFSET 2 LIMIT 4 of the matching rows) is
+    // OFFSET 3 LIMIT 2 of the matching rows.
+    let provider = Arc::new(CaptureDeleteArgsProvider::new(
+        test_schema(),
+        TableProviderFilterPushDown::Unsupported,
+    ));
+    let target = provider_as_source(provider.clone());
+    let input = LogicalPlanBuilder::scan("t", Arc::clone(&target), None)?
+        .filter(col("id").gt(lit(1)))?
+        .limit(2, Some(4))?
+        .limit(1, Some(2))?
+        .build()?;
+    let plan = LogicalPlan::Dml(DmlStatement::new(
+        "t".into(),
+        target,
+        WriteOp::Delete,
+        Arc::new(input),
+    ));
+    DefaultPhysicalPlanner::default()
+        .create_physical_plan(&plan, &SessionContext::new().state())
+        .await?;
+
+    let args = provider
+        .captured_args()
+        .expect("delete_from_args should be called");
+    assert_eq!(args.skip(), Some(3));
+    assert_eq!(args.limit(), Some(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_skip_unsupported_by_provider() -> Result<()> {
+    // `CaptureDeleteProvider` overrides only `delete_from`, which cannot
+    // honor an offset, so the default `delete_from_args` must refuse it.
+    let provider = Arc::new(CaptureDeleteProvider::new(test_schema()));
+    let plan = delete_with_skip_plan(provider.clone(), 1, None)?;
+    let result = SessionContext::new()
+        .execute_logical_plan(plan)
+        .await?
+        .collect()
+        .await;
+
+    assert!(
+        provider.captured_filters().is_none(),
+        "DELETE with an offset must not reach delete_from()"
+    );
+    let err = result.expect_err("an offset is not supported by the provider");
+    assert!(
+        err.to_string().contains("DELETE with OFFSET not supported"),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_memtable_delete_skip_and_limit() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+    )?;
+    let table = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+    // The matching rows are 2..=6: leave 2, delete 3 and 4, keep the rest.
+    let plan = delete_with_skip_plan(table, 1, Some(2))?;
+    let batches = ctx.execute_logical_plan(plan).await?.collect().await?;
+    assert_eq!(rows_affected(&batches), 2);
+
+    let remaining = ctx
+        .sql("SELECT id FROM t ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+    let ids: Vec<i32> = remaining
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id is Int32")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2, 5, 6]);
     Ok(())
 }

@@ -126,7 +126,7 @@ logical_plan
 03)----TableScan: t1
 physical_plan
 01)CooperativeExec
-02)--MemDeleteExec
+02)--MemDeleteExec: limit=10
 
 
 query TT
@@ -139,8 +139,95 @@ logical_plan
 04)------TableScan: t1
 physical_plan
 01)CooperativeExec
-02)--MemDeleteExec: predicate=[CAST(a@0 AS Int64) = 1, b@1 = CAST(2 AS Utf8View)]
+02)--MemDeleteExec: predicate=[CAST(a@0 AS Int64) = 1, b@1 = CAST(2 AS Utf8View)], limit=10
 
 # Config reset
 statement ok
 RESET datafusion.optimizer.max_passes;
+
+
+statement ok
+CREATE TABLE t3(a int, b varchar);
+
+statement ok
+INSERT INTO t3 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+
+query IT
+SELECT * FROM t3;
+----
+1 a
+2 b
+3 c
+4 d
+
+statement ok
+DELETE FROM t3 LIMIT 2;
+
+query IT
+SELECT * FROM t3;
+----
+3 c
+4 d
+
+# LIMIT applies to the rows matching the WHERE clause
+
+statement ok
+INSERT INTO t3 VALUES (5, 'e'), (6, 'f'), (7, 'g');
+
+query IT
+SELECT * FROM t3;
+----
+3 c
+4 d
+5 e
+6 f
+7 g
+
+query I
+DELETE FROM t3 WHERE a > 4 LIMIT 2;
+----
+2
+
+query IT
+SELECT * FROM t3;
+----
+3 c
+4 d
+7 g
+
+# LIMIT larger than the number of matching rows deletes every matching row
+query I
+DELETE FROM t3 WHERE a <= 4 LIMIT 10;
+----
+2
+
+query IT
+SELECT * FROM t3;
+----
+7 g
+
+# LIMIT 0 deletes nothing
+query I
+DELETE FROM t3 LIMIT 0;
+----
+0
+
+query IT
+SELECT * FROM t3;
+----
+7 g
+
+query TT
+EXPLAIN DELETE FROM t3 WHERE a > 1 LIMIT 3;
+----
+logical_plan
+01)Dml: op=[Delete] table=[t3]
+02)--Limit: skip=0, fetch=3
+03)----Filter: t3.a > Int32(1)
+04)------TableScan: t3 projection=[a, b]
+physical_plan
+01)CooperativeExec
+02)--MemDeleteExec: predicate=[a@0 > 1], limit=3
+
+statement ok
+DROP TABLE t3;

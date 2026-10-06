@@ -22,7 +22,7 @@ use std::fmt::Debug;
 use std::future::ready;
 use std::sync::Arc;
 
-use crate::TableProvider;
+use crate::{DeleteArgs, TableProvider};
 
 use arrow::array::{Array, ArrayRef, BooleanArray, UInt64Array};
 use arrow::compute::kernels::zip::zip;
@@ -261,7 +261,28 @@ impl TableProvider for MemTable {
         Self: 'async_trait,
     {
         // Planning a `DELETE` needs no await, so the future is ready at once.
-        Box::pin(ready(self.delete_from_inner(state, &filters)))
+        Box::pin(ready(self.delete_from_inner(state, &filters, None, None)))
+    }
+
+    // Hand-written `#[async_trait]` expansion to reduce compile time. See
+    // <https://github.com/apache/datafusion/issues/13814#issuecomment-5292709677>
+    fn delete_from_args<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+        args: DeleteArgs,
+    ) -> BoxFuture<'async_trait, Result<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        // Planning a `DELETE` needs no await, so the future is ready at once.
+        Box::pin(ready(self.delete_from_inner(
+            state,
+            args.filters(),
+            args.skip(),
+            args.limit(),
+        )))
     }
 
     // Hand-written `#[async_trait]` expansion to reduce compile time. See
@@ -374,6 +395,8 @@ impl MemTable {
         &self,
         state: &dyn Session,
         filters: &[Expr],
+        skip: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         let predicates = create_predicates(filters, &df_schema, state)?;
@@ -382,6 +405,8 @@ impl MemTable {
             self.batches.clone(),
             Arc::clone(&self.sort_order),
             predicates,
+            skip,
+            limit,
         )))
     }
 
@@ -534,6 +559,10 @@ struct MemDeleteExec {
     sort_order: Arc<Mutex<Vec<Vec<SortExpr>>>>,
     /// Predicates of the `WHERE` clause. An empty list matches every row.
     predicates: Vec<Arc<dyn PhysicalExpr>>,
+    /// Number of matching rows to leave before deleting.
+    skip: Option<usize>,
+    /// Maximum number of matching rows to delete, from `DELETE ... LIMIT n`.
+    limit: Option<usize>,
     /// Single `count` column of the output.
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -544,6 +573,8 @@ impl MemDeleteExec {
         partitions: Vec<PartitionData>,
         sort_order: Arc<Mutex<Vec<Vec<SortExpr>>>>,
         predicates: Vec<Arc<dyn PhysicalExpr>>,
+        skip: Option<usize>,
+        limit: Option<usize>,
     ) -> Self {
         let schema = dml_count_schema();
         let properties = dml_plan_properties(&schema);
@@ -552,6 +583,8 @@ impl MemDeleteExec {
             partitions,
             sort_order,
             predicates,
+            skip,
+            limit,
             schema,
             properties,
         }
@@ -568,9 +601,22 @@ impl DisplayAs for MemDeleteExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "MemDeleteExec")?;
+                let mut parts = vec![];
                 if !self.predicates.is_empty() {
-                    write!(f, ": predicate=[{}]", format_predicates(&self.predicates))?;
+                    parts.push(format!(
+                        "predicate=[{}]",
+                        format_predicates(&self.predicates)
+                    ));
+                }
+                if let Some(skip) = self.skip {
+                    parts.push(format!("skip={skip}"));
+                }
+                if let Some(limit) = self.limit {
+                    parts.push(format!("limit={limit}"));
+                }
+                write!(f, "MemDeleteExec")?;
+                if !parts.is_empty() {
+                    write!(f, ": {}", parts.join(", "))?;
                 }
                 Ok(())
             }
@@ -627,11 +673,13 @@ impl ExecutionPlan for MemDeleteExec {
         let partitions = self.partitions.clone();
         let sort_order = Arc::clone(&self.sort_order);
         let predicates = self.predicates.clone();
+        let skip = self.skip;
+        let limit = self.limit;
         let schema = self.schema();
 
         let stream = futures::stream::once(async move {
             let rows_affected =
-                delete_rows(&partitions, &sort_order, &predicates).await?;
+                delete_rows(&partitions, &sort_order, &predicates, skip, limit).await?;
             count_batch(schema, rows_affected)
         });
 
@@ -650,15 +698,24 @@ impl ExecutionPlan for MemDeleteExec {
 }
 
 /// Delete the matching rows of every partition and return how many it removed.
+///
+/// Matching rows are counted in partition and batch order. With `skip`, leave
+/// the first `skip` of them; with `limit`, delete at most `limit` of the rest.
 async fn delete_rows(
     partitions: &[PartitionData],
     sort_order: &Mutex<Vec<Vec<SortExpr>>>,
     predicates: &[Arc<dyn PhysicalExpr>],
+    skip: Option<usize>,
+    limit: Option<usize>,
 ) -> Result<u64> {
     // The surviving rows hold no known order.
     *sort_order.lock() = vec![];
 
     let mut total_deleted: u64 = 0;
+    // Matching rows still to leave before deleting.
+    let mut to_skip = skip.unwrap_or(0);
+    // Matching rows that may still be deleted under the limit.
+    let mut remaining = limit;
 
     for partition_data in partitions {
         let mut partition = partition_data.write().await;
@@ -666,6 +723,11 @@ async fn delete_rows(
 
         for batch in partition.iter() {
             if batch.num_rows() == 0 {
+                continue;
+            }
+
+            if remaining == Some(0) {
+                new_batches.push(batch.clone());
                 continue;
             }
 
@@ -687,6 +749,33 @@ async fn delete_rows(
                         BooleanArray::from(vec![false; batch.num_rows()]),
                     )
                 }
+            };
+
+            // Keep the skipped matching rows and the matching rows past the limit.
+            let (delete_count, keep_mask) = if to_skip > 0 || remaining.is_some() {
+                let mut count = 0;
+                let keep: BooleanArray = keep_mask
+                    .iter()
+                    .map(|keep| {
+                        if keep != Some(false) {
+                            Some(true)
+                        } else if to_skip > 0 {
+                            to_skip -= 1;
+                            Some(true)
+                        } else if remaining.is_none_or(|remaining| count < remaining) {
+                            count += 1;
+                            Some(false)
+                        } else {
+                            Some(true)
+                        }
+                    })
+                    .collect();
+                if let Some(remaining) = remaining.as_mut() {
+                    *remaining -= count;
+                }
+                (count, keep)
+            } else {
+                (delete_count, keep_mask)
             };
 
             total_deleted += delete_count as u64;

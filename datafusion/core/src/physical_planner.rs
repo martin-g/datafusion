@@ -61,12 +61,13 @@ use arrow::array::{ArrayRef, RecordBatch, UInt64Array, builder::StringBuilder};
 use arrow::compute::SortOptions;
 use arrow::datatypes::Schema;
 use arrow_schema::Field;
-use datafusion_catalog::ScanArgs;
+use datafusion_catalog::{DeleteArgs, ScanArgs};
 use datafusion_common::Column;
 use datafusion_common::HashMap as DFHashMap;
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::format::ExplainAnalyzeCategories;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion_common::utils::combine_limit;
 use datafusion_common::{
     DFSchema, DFSchemaRef, ScalarValue, exec_err, internal_datafusion_err, internal_err,
     not_impl_err, plan_err,
@@ -806,9 +807,14 @@ impl DefaultPhysicalPlanner {
                         DmlInput::Filters => {
                             let filters =
                                 extract_dml_filters(input, table_name, &allowed_refs)?;
+                            let limit = extract_dml_limit(input, table_name)?;
+                            let args = DeleteArgs::default()
+                                .with_filters(filters)
+                                .with_limit(limit.fetch)
+                                .with_skip(limit.skip);
                             provider
                                 .table_provider
-                                .delete_from(session_state, filters)
+                                .delete_from_args(session_state, args)
                                 .await
                                 .map_err(|e| {
                                     e.context(format!(
@@ -2381,10 +2387,9 @@ fn classify_dml_input(
             | LogicalPlan::SubqueryAlias(_)
             | LogicalPlan::Sort(_)
             | LogicalPlan::Repartition(_)
-            // A `Limit` carries no predicate, so it reaches the provider as no
-            // filter at all and `DELETE FROM t LIMIT n` deletes every matching
-            // row. `UPDATE ... LIMIT` is already rejected by the SQL planner.
-            // That gap is separate from this one, and it is tracked separately.
+            // A `Limit` carries no predicate. For a DELETE it reaches the
+            // provider as a row limit, see `extract_dml_limit`. `UPDATE ...
+            // LIMIT` is already rejected by the SQL planner.
             | LogicalPlan::Limit(_)
             // A subquery expression that survives to this point fails later,
             // when the provider compiles the filter it belongs to.
@@ -2529,6 +2534,98 @@ fn extract_dml_filters(
             }
             Ok(deduped)
         })
+}
+
+/// The offset and the row limit of a DELETE, from [`extract_dml_limit`].
+struct DmlLimit {
+    /// Number of matching rows to leave before deleting, or `None` for none.
+    skip: Option<usize>,
+    /// Maximum number of matching rows to delete, or `None` for no limit.
+    fetch: Option<usize>,
+}
+
+/// Extract the offset and the row limit of a DELETE from its input plan.
+///
+/// The SQL planner puts a `Limit` above the target table scan for
+/// `DELETE FROM t [WHERE ...] LIMIT n`, and the optimizer may also push the
+/// limit into the scan as its `fetch` and, when the source supports it, its
+/// `skip`. All of them apply to the matching rows, so walking from the root
+/// down they compose like nested limits (see [`combine_limit`]).
+///
+/// # Parameters
+/// - `input`: the input plan of the DELETE
+/// - `target`: the target table of the statement
+///
+/// # Returns
+/// * the combined offset and row limit, each `None` when absent
+/// * a "not implemented" error when they cannot be expressed on the filtered
+///   rows: the limit is not a literal, or it sits below a filter
+fn extract_dml_limit(
+    input: &Arc<LogicalPlan>,
+    target: &TableReference,
+) -> Result<DmlLimit> {
+    let mut skip = 0;
+    let mut fetch: Option<usize> = None;
+    let mut seen_filter = false;
+
+    // `classify_dml_input` has already rejected joins, unions and the other
+    // nodes with several inputs, so the walk follows a single chain from the
+    // root down to the target table scan, and each limit it meets is the
+    // child of the limits combined so far.
+    input.apply(|node| {
+        let (child_skip, child_fetch) = match node {
+            LogicalPlan::Filter(_) => {
+                seen_filter = true;
+                return Ok(TreeNodeRecursion::Continue);
+            }
+            LogicalPlan::Limit(limit) => {
+                let child_skip = match limit.get_skip_type()? {
+                    SkipType::Literal(skip) => skip,
+                    SkipType::UnsupportedExpr => {
+                        return not_impl_err!(
+                            "Unsupported OFFSET expression in DELETE on table '{target}': {:?}",
+                            limit.skip
+                        );
+                    }
+                };
+                let child_fetch = match limit.get_fetch_type()? {
+                    FetchType::Literal(fetch) => fetch,
+                    FetchType::UnsupportedExpr => {
+                        return not_impl_err!(
+                            "Unsupported LIMIT expression in DELETE on table '{target}': {:?}",
+                            limit.fetch
+                        );
+                    }
+                };
+                (child_skip, child_fetch)
+            }
+            // The `skip` and the `fetch` of a scan apply after its pushed-down
+            // filters, so they limit the matching rows like a `Limit` above it.
+            LogicalPlan::TableScan(scan) if scan.table_name.resolved_eq(target) => {
+                (scan.skip.unwrap_or(0), scan.fetch)
+            }
+            _ => return Ok(TreeNodeRecursion::Continue),
+        };
+
+        if child_skip == 0 && child_fetch.is_none() {
+            return Ok(TreeNodeRecursion::Continue);
+        }
+        // A limit below a filter restricts the rows before the filter applies,
+        // which a filter list with an offset and a row count cannot express.
+        if seen_filter {
+            return not_impl_err!(
+                "DELETE on table '{target}' with a LIMIT or an OFFSET below a filter \
+                 is not supported"
+            );
+        }
+        (skip, fetch) = combine_limit(skip, fetch, child_skip, child_fetch);
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+
+    Ok(DmlLimit {
+        skip: (skip > 0).then_some(skip),
+        fetch,
+    })
 }
 
 /// Determine whether a predicate references only columns from the target table

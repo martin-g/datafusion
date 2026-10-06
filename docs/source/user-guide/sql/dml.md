@@ -142,7 +142,7 @@ INSERT INTO <i><b>table_name</i></b> { VALUES ( <i><b>expression</i></b> [, ...]
 Removes rows from a table.
 
 <pre>
-DELETE FROM <i><b>table_name</b></i> [ WHERE <i><b>condition</b></i> ]
+DELETE FROM <i><b>table_name</b></i> [ WHERE <i><b>condition</b></i> ] [ LIMIT <i><b>count</b></i> ]
 </pre>
 
 `DELETE` returns the number of removed rows in a column named `count`.
@@ -150,6 +150,8 @@ DELETE FROM <i><b>table_name</b></i> [ WHERE <i><b>condition</b></i> ]
 If you omit the `WHERE` clause, DataFusion removes all rows.
 
 DataFusion removes a row only if the condition is true for that row. SQL three-valued logic applies: if the condition evaluates to `NULL`, the row remains. For example, `WHERE value > 15` keeps a row with a `NULL` value, because `NULL > 15` is `NULL`.
+
+With `LIMIT`, DataFusion removes at most `count` of the matching rows. Which rows are removed is not specified. Table providers that do not support `LIMIT` return an error rather than removing every matching row.
 
 Not all tables support `DELETE`. See [Table support for DELETE and UPDATE](#table-support-for-delete-and-update).
 
@@ -225,5 +227,4 @@ Not all table providers support `DELETE` and `UPDATE`. In-memory tables created 
 
 - Subqueries in `DELETE` and `UPDATE` conditions can affect unintended rows: [#24654](https://github.com/apache/datafusion/issues/24654).
 - `EXPLAIN DELETE` and `EXPLAIN UPDATE` can modify in-memory tables: [#24656](https://github.com/apache/datafusion/issues/24656).
-- `DELETE` ignores `LIMIT`: [#24998](https://github.com/apache/datafusion/issues/24998).
 - `UPDATE ... FROM` is not supported: [#19950](https://github.com/apache/datafusion/issues/19950).

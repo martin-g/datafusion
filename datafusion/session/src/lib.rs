@@ -63,6 +63,6 @@ pub use crate::planner::{
 pub use crate::schema::SchemaProvider;
 pub use crate::session::{Session, SessionStore};
 pub use crate::table::{
-    ScanArgs, ScanResult, TableFunction, TableFunctionArgs, TableFunctionImpl,
-    TableProvider, TableProviderFactory,
+    DeleteArgs, ScanArgs, ScanResult, TableFunction, TableFunctionArgs,
+    TableFunctionImpl, TableProvider, TableProviderFactory,
 };

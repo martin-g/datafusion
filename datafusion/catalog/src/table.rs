@@ -17,6 +17,6 @@
 
 // Re-export from this module for backwards compatibility.
 pub use datafusion_session::{
-    ScanArgs, ScanResult, TableFunction, TableFunctionArgs, TableFunctionImpl,
-    TableProvider, TableProviderFactory,
+    DeleteArgs, ScanArgs, ScanResult, TableFunction, TableFunctionArgs,
+    TableFunctionImpl, TableProvider, TableProviderFactory,
 };
